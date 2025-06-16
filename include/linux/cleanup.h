@@ -2,6 +2,7 @@
 #ifndef _LINUX_CLEANUP_H
 #define _LINUX_CLEANUP_H
 
+#include <linux/stdarg.h>
 #include <linux/compiler.h>
 
 /**
@@ -259,24 +260,28 @@ const volatile void * __must_check_fn(const volatile void *val)
  *	// use 'f' without concern
  */
 
+#define __ARGC(_9, _8, _7, _6, _5, _4, _3, _2, _1, N, ...)		N
+#define ARGC(...) __ARGC(9, ##__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+
 #define DEFINE_CLASS(_name, _type, _exit, _init, _init_args...)		\
 typedef _type class_##_name##_t;					\
 static inline void class_##_name##_destructor(_type *p)			\
 { _type _T = *p; _exit; }						\
-static inline _type class_##_name##_constructor(_init_args)		\
+static inline _type class_##_name##_constructor(int argc, ##_init_args)	\
 { _type t = _init; return t; }
 
 #define EXTEND_CLASS(_name, ext, _init, _init_args...)			\
 typedef class_##_name##_t class_##_name##ext##_t;			\
 static inline void class_##_name##ext##_destructor(class_##_name##_t *p)\
 { class_##_name##_destructor(p); }					\
-static inline class_##_name##_t class_##_name##ext##_constructor(_init_args) \
+static inline class_##_name##_t class_##_name##ext##_constructor(int argc, ##_init_args) \
 { class_##_name##_t t = _init; return t; }
 
-#define CLASS(_name, var)						\
+#define __CLASS(_name, var, argc, args...)						\
 	class_##_name##_t var __cleanup(class_##_name##_destructor) =	\
-		class_##_name##_constructor
+		class_##_name##_constructor(argc, ##args)
 
+#define CLASS(_name, var, args...) __CLASS(_name, var, ARGC(args), ##args)
 
 /*
  * DEFINE_GUARD(name, type, lock, unlock):
@@ -334,8 +339,8 @@ static __maybe_unused const bool class_##_name##_is_conditional = _is_cond
 	static inline void * class_##_name##_ext##_lock_ptr(class_##_name##_t *_T) \
 	{ return class_##_name##_lock_ptr(_T); }
 
-#define guard(_name) \
-	CLASS(_name, __UNIQUE_ID(guard))
+#define guard(_name, args...) \
+	__CLASS(_name, __UNIQUE_ID(guard), ARGC(args), ##args)
 
 #define __guard_ptr(_name) class_##_name##_lock_ptr
 #define __is_cond_ptr(_name) class_##_name##_is_conditional
@@ -349,8 +354,8 @@ static __maybe_unused const bool class_##_name##_is_conditional = _is_cond
  * It is needed because the other part - "__guard_ptr(_name)(&scope)" - is too
  * hard to deduce (even if could be proven true for unconditional locks).
  */
-#define __scoped_guard(_name, _label, args...)				\
-	for (CLASS(_name, scope)(args);					\
+#define __scoped_guard(_name, _label, argc, args...)			\
+	for (__CLASS(_name, scope, argc, ##args);			\
 	     __guard_ptr(_name)(&scope) || !__is_cond_ptr(_name);	\
 	     ({ goto _label; }))					\
 		if (0) {						\
@@ -359,10 +364,10 @@ _label:									\
 		} else
 
 #define scoped_guard(_name, args...)	\
-	__scoped_guard(_name, __UNIQUE_ID(label), args)
+	__scoped_guard(_name, __UNIQUE_ID(label), ARGC(args), ##args)
 
-#define __scoped_cond_guard(_name, _fail, _label, args...)		\
-	for (CLASS(_name, scope)(args); true; ({ goto _label; }))	\
+#define __scoped_cond_guard(_name, _fail, _label, argc, args...)	\
+	for (__CLASS(_name, scope, argc, ##args); true; ({ goto _label; }))	\
 		if (!__guard_ptr(_name)(&scope)) {			\
 			BUILD_BUG_ON(!__is_cond_ptr(_name));		\
 			_fail;						\
@@ -371,7 +376,7 @@ _label:									\
 		} else
 
 #define scoped_cond_guard(_name, _fail, args...)	\
-	__scoped_cond_guard(_name, _fail, __UNIQUE_ID(label), args)
+	__scoped_cond_guard(_name, _fail, __UNIQUE_ID(label), ARGC(args), ##args)
 
 /*
  * Additional helper macros for generating lock guards with types, either for
@@ -422,6 +427,27 @@ static inline class_##_name##_t class_##_name##_constructor(void)	\
 	_lock;								\
 	return _t;							\
 }
+
+#define __DEFINE_LOCK_GUARD(_name, _type, _lock)			\
+	static inline class_##_name##_t class_##_name##_constructor_x(void *l) { \
+		class_##_name##_t _t = { .lock = (_type *)l },		\
+		*_T __maybe_unused = &_t;				\
+		_lock;							\
+		return _t;						\
+	}								\
+	static inline class_##_name##_t class_##_name##_constructor(int argc, ...) { \
+		BUILD_BUG_ON(argc > 1);					\
+		va_list args;  						\
+		va_start(args, argc);                              	\
+		void *arg = argc ? va_arg(args, _type *) : (void *)8;	\
+		va_end(args);                                       	\
+		return class_##_name##_constructor_x(arg);		\
+	}
+
+#define DEFINE_LOCK_GUARD(_name, _type, _lock, _unlock, ...)		\
+	__DEFINE_CLASS_IS_CONDITIONAL(_name, false);			\
+	__DEFINE_UNLOCK_GUARD(_name, _type, _unlock, __VA_ARGS__)	\
+	__DEFINE_LOCK_GUARD(_name, _type, _lock)
 
 #define DEFINE_LOCK_GUARD_1(_name, _type, _lock, _unlock, ...)		\
 __DEFINE_CLASS_IS_CONDITIONAL(_name, false);				\
