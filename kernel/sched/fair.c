@@ -849,6 +849,9 @@ RB_DECLARE_CALLBACKS(static, min_vruntime_cb, struct sched_entity,
  */
 static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
+	if (se == cfs_rq->curr)
+		return;
+
 	avg_vruntime_add(cfs_rq, se);
 	se->min_vruntime = se->vruntime;
 	se->min_slice = se->slice;
@@ -858,6 +861,9 @@ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
+	if (se == cfs_rq->curr)
+		return;
+
 	rb_erase_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
 				  &min_vruntime_cb);
 	avg_vruntime_sub(cfs_rq, se);
@@ -3797,8 +3803,6 @@ static void place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int fla
 static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
-	bool curr = cfs_rq->curr == se;
-
 	if (se->on_rq) {
 		/* commit outstanding execution time */
 		update_curr(cfs_rq);
@@ -3806,8 +3810,7 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 		se->deadline -= se->vruntime;
 		se->rel_deadline = 1;
 		cfs_rq->nr_queued--;
-		if (!curr)
-			__dequeue_entity(cfs_rq, se);
+		__dequeue_entity(cfs_rq, se);
 		update_load_sub(&cfs_rq->load, se->load.weight);
 	}
 	dequeue_load_avg(cfs_rq, se);
@@ -3834,8 +3837,7 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 	if (se->on_rq) {
 		place_entity(cfs_rq, se, 0);
 		update_load_add(&cfs_rq->load, se->load.weight);
-		if (!curr)
-			__enqueue_entity(cfs_rq, se);
+		__enqueue_entity(cfs_rq, se);
 		cfs_rq->nr_queued++;
 
 		/*
@@ -5363,8 +5365,7 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	check_schedstat_required();
 	update_stats_enqueue_fair(cfs_rq, se, flags);
-	if (!curr)
-		__enqueue_entity(cfs_rq, se);
+	__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;
 
 	if (cfs_rq->nr_queued == 1) {
@@ -5506,8 +5507,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		se->rel_deadline = 1;
 	}
 
-	if (se != cfs_rq->curr)
-		__dequeue_entity(cfs_rq, se);
+	__dequeue_entity(cfs_rq, se);
 	se->on_rq = 0;
 	account_entity_dequeue(cfs_rq, se);
 
@@ -5624,14 +5624,15 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
 	/* throttle cfs_rqs exceeding runtime */
 	check_cfs_rq_runtime(cfs_rq);
 
+	WARN_ON_ONCE(cfs_rq->curr != prev);
 	if (prev->on_rq) {
 		update_stats_wait_start_fair(cfs_rq, prev);
-		/* Put 'current' back into the tree. */
+		cfs_rq->curr = NULL;
 		__enqueue_entity(cfs_rq, prev);
+		cfs_rq->curr = prev;
 		/* in !on_rq case, update occurred at dequeue */
 		update_load_avg(cfs_rq, prev, 0);
 	}
-	WARN_ON_ONCE(cfs_rq->curr != prev);
 	cfs_rq->curr = NULL;
 }
 
@@ -6910,12 +6911,10 @@ requeue_delayed_entity(struct sched_entity *se)
 		update_entity_lag(cfs_rq, se);
 		if (se->vlag > 0) {
 			cfs_rq->nr_queued--;
-			if (se != cfs_rq->curr)
-				__dequeue_entity(cfs_rq, se);
+			__dequeue_entity(cfs_rq, se);
 			se->vlag = 0;
 			place_entity(cfs_rq, se, 0);
-			if (se != cfs_rq->curr)
-				__enqueue_entity(cfs_rq, se);
+			__enqueue_entity(cfs_rq, se);
 			cfs_rq->nr_queued++;
 		}
 	}
