@@ -2041,7 +2041,7 @@ static inline void set_tsk_need_resched(struct task_struct *tsk)
 
 static inline void clear_tsk_need_resched(struct task_struct *tsk)
 {
-	atomic_long_andnot(_TIF_NEED_RESCHED | _TIF_NEED_RESCHED_LAZY,
+	atomic_long_andnot(_TIF_NEED_RESCHED_MUSK,
 			   (atomic_long_t *)&task_thread_info(tsk)->flags);
 }
 

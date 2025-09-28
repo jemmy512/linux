@@ -1108,7 +1108,7 @@ static void __resched_curr(struct rq *rq, int tif)
 	if (is_idle_task(curr) && tif == TIF_NEED_RESCHED_LAZY)
 		tif = TIF_NEED_RESCHED;
 
-	if (cti->flags & ((1 << tif) | _TIF_NEED_RESCHED))
+	if (cti->flags & ((1 << tif) | _TIF_NEED_RESCHED_MUSK))
 		return;
 
 	cpu = cpu_of(rq);
