@@ -3733,25 +3733,42 @@ static int ttwu_runnable(struct task_struct *p, int wake_flags)
 
 void sched_ttwu_pending(void *arg)
 {
-	struct llist_node *llist = arg;
+	struct llist_node *prev, *head = arg;
 	struct rq *rq = this_rq();
-	struct task_struct *p, *t;
+	struct task_struct *cur, *next;
 	struct rq_flags rf;
 
-	if (!llist)
+	if (!head)
 		return;
 
 	rq_lock_irqsave(rq, &rf);
 	update_rq_clock(rq);
 
-	llist_for_each_entry_safe(p, t, llist, wake_entry.llist) {
-		if (WARN_ON_ONCE(p->on_cpu))
-			smp_cond_load_acquire(&p->on_cpu, !VAL);
+repeat:
+	prev = NULL;
+	llist_for_each_entry_safe(cur, next, head, wake_entry.llist) {
+		if (WARN_ON_ONCE(cur->on_cpu)) {
+			prev = &cur->wake_entry.llist;
+			continue;
+		}
 
-		if (WARN_ON_ONCE(task_cpu(p) != cpu_of(rq)))
-			set_task_cpu(p, cpu_of(rq));
+		if (prev) {
+			prev->next = &next->wake_entry.llist;
+		} else {
+			head = &next->wake_entry.llist;
+		}
 
-		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
+		if (WARN_ON_ONCE(task_cpu(cur) != cpu_of(rq)))
+			set_task_cpu(cur, cpu_of(rq));
+
+		ttwu_do_activate(rq, cur, cur->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
+	}
+
+	if (unlikely(head)) {
+		llist_for_each_entry_safe(cur, next, head, wake_entry.llist) {
+			smp_cond_load_acquire(&cur->on_cpu, !VAL);
+			goto repeat;
+		}
 	}
 
 	/*
