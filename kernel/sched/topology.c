@@ -891,7 +891,8 @@ static unsigned long get_effective_llc_bytes(int cpu,
 static bool alloc_sd_llc(const struct cpumask *cpu_map,
 			 struct s_data *d)
 {
-	struct sched_domain *sd, *top_llc, *parent;
+	struct sched_domain *sd, *top_llc = NULL, *parent;
+	unsigned long llc_bytes = 0;
 	unsigned int *p;
 	int i;
 
@@ -905,20 +906,29 @@ static bool alloc_sd_llc(const struct cpumask *cpu_map,
 		if (!p)
 			goto err;
 
-		top_llc = sd;
 		/*
-		 * Find the topmost SD_SHARE_LLC domain.
+		 * Non-NUMA LLC spans do not partially overlap. Reuse the
+		 * previous top LLC and its llc_bytes while this CPU is still
+		 * inside that span. Walk only when the LLC changes.
 		 * Not yet attached to the CPU, so per_cpu(sd_llc, i)
 		 * can not be used.
 		 */
-		while ((parent = rcu_dereference_protected(top_llc->parent, true)) &&
-		       (parent->flags & SD_SHARE_LLC))
-			top_llc = parent;
+		if (!top_llc || !cpumask_test_cpu(i, sched_domain_span(top_llc))) {
+			top_llc = sd;
+			while ((parent = rcu_dereference_protected(top_llc->parent, true)) &&
+			       (parent->flags & SD_SHARE_LLC))
+				top_llc = parent;
 
-		if (top_llc->flags & SD_SHARE_LLC) {
+			if (top_llc->flags & SD_SHARE_LLC)
+				llc_bytes = get_effective_llc_bytes(i, top_llc);
+			else
+				top_llc = NULL;
+		}
+
+		if (top_llc) {
 			sd->llc_max = max_lid + 1;
 			sd->llc_counts = p;
-			sd->llc_bytes = get_effective_llc_bytes(i, top_llc);
+			sd->llc_bytes = llc_bytes;
 		} else {
 			/* avoid memory leak */
 			kfree(p);
