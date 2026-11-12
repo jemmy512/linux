@@ -1171,7 +1171,8 @@ static void folio_reclaim_fixup_split(struct folio *folio,
 
 /*
  * What shrink_one_folio() decided to do with a folio, and whether the
- * folio is still locked.
+ * folio is still locked. FOLIO_RECLAIM_NEXT is only passed between the
+ * steps of shrink_one_folio() and is never returned by it.
  */
 enum folio_reclaim_action {
 	FOLIO_RECLAIM_FREE,		/* unlocked, refcount dropped to zero */
@@ -1180,6 +1181,7 @@ enum folio_reclaim_action {
 	FOLIO_RECLAIM_KEEP_LOCKED,	/* locked */
 	FOLIO_RECLAIM_KEEP,		/* unlocked */
 	FOLIO_RECLAIM_DONE,		/* handed off, nothing left to do */
+	FOLIO_RECLAIM_NEXT,		/* locked, go on to the next step */
 };
 
 struct shrink_folio_walk {
@@ -1304,6 +1306,76 @@ folio_reclaim_writeback(struct folio *folio, struct shrink_folio_walk *w)
 	}
 }
 
+/*
+ * Allocate swap space for an anonymous folio, splitting a large folio
+ * first if needed. On success the folio is dirtied and still locked.
+ */
+static enum folio_reclaim_action
+folio_reclaim_prepare_swap(struct folio *folio, struct shrink_folio_walk *w)
+{
+	struct scan_control *sc = w->sc;
+	int ret;
+
+	if (!(sc->gfp_mask & __GFP_IO))
+		return FOLIO_RECLAIM_KEEP_LOCKED;
+	if (folio_maybe_dma_pinned(folio))
+		return FOLIO_RECLAIM_KEEP_LOCKED;
+	if (folio_test_large(folio)) {
+		/* cannot split folio, skip it */
+		if (folio_expected_ref_count(folio) !=
+		    folio_ref_count(folio) - 1)
+			return FOLIO_RECLAIM_ACTIVATE;
+		/*
+		 * Split partially mapped folios right away.
+		 * We can free the unmapped pages without IO.
+		 */
+		if (data_race(!list_empty(&folio->_deferred_list) &&
+		    folio_test_partially_mapped(folio)) &&
+		    split_folio_to_list(folio, w->folio_list))
+			return FOLIO_RECLAIM_ACTIVATE;
+	}
+	ret = folio_alloc_swap(folio);
+	if (ret) {
+		int __maybe_unused order = folio_order(folio);
+
+		if (!folio_test_large(folio)) {
+			folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
+			return FOLIO_RECLAIM_ACTIVATE;
+		}
+		if (ret != -E2BIG)
+			return FOLIO_RECLAIM_ACTIVATE;
+		/* Fallback to swap normal pages */
+		if (split_folio_to_list(folio, w->folio_list))
+			return FOLIO_RECLAIM_ACTIVATE;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+		if (w->nr_pages >= HPAGE_PMD_NR) {
+			count_memcg_folio_events(folio,
+				THP_SWPOUT_FALLBACK, 1);
+			count_vm_event(THP_SWPOUT_FALLBACK);
+		}
+#endif
+		count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
+		if (folio_alloc_swap(folio)) {
+			folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
+			return FOLIO_RECLAIM_ACTIVATE;
+		}
+	}
+	/*
+	 * Normally the folio will be dirtied in unmap because
+	 * its pte should be dirty. A special case is MADV_FREE
+	 * page. The page's pte could have dirty bit cleared but
+	 * the folio's SwapBacked flag is still set because
+	 * clearing the dirty bit and SwapBacked flag has no
+	 * lock protected. For such folio, unmap will not set
+	 * dirty bit for it, so folio reclaim will not write the
+	 * folio out. This can cause data corruption when the
+	 * folio is swapped in later. Always setting the dirty
+	 * flag for the folio solves the problem.
+	 */
+	folio_mark_dirty(folio);
+	return FOLIO_RECLAIM_NEXT;
+}
+
 static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 						  struct shrink_folio_walk *w)
 {
@@ -1311,6 +1383,7 @@ static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 	struct reclaim_stat *stat = w->stat;
 	struct address_space *mapping;
 	enum folio_references references = FOLIOREF_RECLAIM;
+	enum folio_reclaim_action act;
 	bool dirty, writeback;
 
 	if (!folio_trylock(folio))
@@ -1399,65 +1472,9 @@ static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 	 */
 	if (folio_test_anon(folio) && folio_test_swapbacked(folio) &&
 			!folio_test_swapcache(folio)) {
-		int ret;
-
-		if (!(sc->gfp_mask & __GFP_IO))
-			return FOLIO_RECLAIM_KEEP_LOCKED;
-		if (folio_maybe_dma_pinned(folio))
-			return FOLIO_RECLAIM_KEEP_LOCKED;
-		if (folio_test_large(folio)) {
-			/* cannot split folio, skip it */
-			if (folio_expected_ref_count(folio) !=
-			    folio_ref_count(folio) - 1)
-				return FOLIO_RECLAIM_ACTIVATE;
-			/*
-			 * Split partially mapped folios right away.
-			 * We can free the unmapped pages without IO.
-			 */
-			if (data_race(!list_empty(&folio->_deferred_list) &&
-			    folio_test_partially_mapped(folio)) &&
-			    split_folio_to_list(folio, w->folio_list))
-				return FOLIO_RECLAIM_ACTIVATE;
-		}
-		ret = folio_alloc_swap(folio);
-		if (ret) {
-			int __maybe_unused order = folio_order(folio);
-
-			if (!folio_test_large(folio)) {
-				folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
-				return FOLIO_RECLAIM_ACTIVATE;
-			}
-			if (ret != -E2BIG)
-				return FOLIO_RECLAIM_ACTIVATE;
-			/* Fallback to swap normal pages */
-			if (split_folio_to_list(folio, w->folio_list))
-				return FOLIO_RECLAIM_ACTIVATE;
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-			if (w->nr_pages >= HPAGE_PMD_NR) {
-				count_memcg_folio_events(folio,
-					THP_SWPOUT_FALLBACK, 1);
-				count_vm_event(THP_SWPOUT_FALLBACK);
-			}
-#endif
-			count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
-			if (folio_alloc_swap(folio)) {
-				folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
-				return FOLIO_RECLAIM_ACTIVATE;
-			}
-		}
-		/*
-		 * Normally the folio will be dirtied in unmap because
-		 * its pte should be dirty. A special case is MADV_FREE
-		 * page. The page's pte could have dirty bit cleared but
-		 * the folio's SwapBacked flag is still set because
-		 * clearing the dirty bit and SwapBacked flag has no
-		 * lock protected. For such folio, unmap will not set
-		 * dirty bit for it, so folio reclaim will not write the
-		 * folio out. This can cause data corruption when the
-		 * folio is swapped in later. Always setting the dirty
-		 * flag for the folio solves the problem.
-		 */
-		folio_mark_dirty(folio);
+		act = folio_reclaim_prepare_swap(folio, w);
+		if (act != FOLIO_RECLAIM_NEXT)
+			return act;
 	}
 
 	folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
@@ -1687,6 +1704,7 @@ retry:
 		case FOLIO_RECLAIM_ACTIVATE:
 			folio_reclaim_activate(folio, &w);
 			fallthrough;
+		case FOLIO_RECLAIM_NEXT:
 		case FOLIO_RECLAIM_KEEP_LOCKED:
 			folio_unlock(folio);
 			fallthrough;
