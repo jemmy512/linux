@@ -1483,6 +1483,79 @@ folio_reclaim_writeout(struct folio *folio, struct address_space **mapping,
 	return FOLIO_RECLAIM_NEXT;
 }
 
+/*
+ * Drop the buffers of an unmapped folio and detach it from its mapping
+ * so that it can be freed.
+ */
+static enum folio_reclaim_action
+folio_reclaim_release(struct folio *folio, struct address_space *mapping,
+		      struct shrink_folio_walk *w)
+{
+	struct scan_control *sc = w->sc;
+
+	/*
+	 * If the folio has buffers, try to free the buffer
+	 * mappings associated with this folio. If we succeed
+	 * we try to free the folio as well.
+	 *
+	 * We do this even if the folio is dirty.
+	 * filemap_release_folio() does not perform I/O, but it
+	 * is possible for a folio to have the dirty flag set,
+	 * but it is actually clean (all its buffers are clean).
+	 * This happens if the buffers were written out directly,
+	 * with bh_submit(). ext3 will do this, as well as
+	 * the blockdev mapping.  filemap_release_folio() will
+	 * discover that cleanness and will drop the buffers
+	 * and mark the folio clean - it can be freed.
+	 *
+	 * Rarely, folios can have buffers and no ->mapping.
+	 * These are the folios which were not successfully
+	 * invalidated in truncate_cleanup_folio().  We try to
+	 * drop those buffers here and if that worked, and the
+	 * folio is no longer mapped into process address space
+	 * (refcount == 1) it can be freed.  Otherwise, leave
+	 * the folio on the LRU so it is swappable.
+	 */
+	if (folio_needs_release(folio)) {
+		if (!filemap_release_folio(folio, sc->gfp_mask))
+			return FOLIO_RECLAIM_ACTIVATE;
+		if (!mapping && folio_ref_count(folio) == 1) {
+			folio_unlock(folio);
+			if (folio_put_testzero(folio))
+				return FOLIO_RECLAIM_FREE;
+			/*
+			 * rare race with speculative reference.
+			 * the speculative reference will free
+			 * this folio shortly, so we may
+			 * increment nr_reclaimed here (and
+			 * leave it off the LRU).
+			 */
+			return FOLIO_RECLAIM_FREED;
+		}
+	}
+
+	if (folio_test_lazyfree(folio)) {
+		/* follow __remove_mapping for reference */
+		if (!folio_ref_freeze(folio, 1))
+			return FOLIO_RECLAIM_KEEP_LOCKED;
+		/*
+		 * The folio has only one reference left, which is
+		 * from the isolation. After the caller puts the
+		 * folio back on the lru and drops the reference, the
+		 * folio will be freed anyway. It doesn't matter
+		 * which lru it goes on. So we don't bother checking
+		 * the dirty flag here.
+		 */
+		count_vm_events(PGLAZYFREED, w->nr_pages);
+		count_memcg_folio_events(folio, PGLAZYFREED, w->nr_pages);
+	} else if (!mapping || !__remove_mapping(mapping, folio, true,
+						 sc->target_mem_cgroup))
+		return FOLIO_RECLAIM_KEEP_LOCKED;
+
+	folio_unlock(folio);
+	return FOLIO_RECLAIM_FREE;
+}
+
 static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 						  struct shrink_folio_walk *w)
 {
@@ -1606,67 +1679,7 @@ static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 			return act;
 	}
 
-	/*
-	 * If the folio has buffers, try to free the buffer
-	 * mappings associated with this folio. If we succeed
-	 * we try to free the folio as well.
-	 *
-	 * We do this even if the folio is dirty.
-	 * filemap_release_folio() does not perform I/O, but it
-	 * is possible for a folio to have the dirty flag set,
-	 * but it is actually clean (all its buffers are clean).
-	 * This happens if the buffers were written out directly,
-	 * with bh_submit(). ext3 will do this, as well as
-	 * the blockdev mapping.  filemap_release_folio() will
-	 * discover that cleanness and will drop the buffers
-	 * and mark the folio clean - it can be freed.
-	 *
-	 * Rarely, folios can have buffers and no ->mapping.
-	 * These are the folios which were not successfully
-	 * invalidated in truncate_cleanup_folio().  We try to
-	 * drop those buffers here and if that worked, and the
-	 * folio is no longer mapped into process address space
-	 * (refcount == 1) it can be freed.  Otherwise, leave
-	 * the folio on the LRU so it is swappable.
-	 */
-	if (folio_needs_release(folio)) {
-		if (!filemap_release_folio(folio, sc->gfp_mask))
-			return FOLIO_RECLAIM_ACTIVATE;
-		if (!mapping && folio_ref_count(folio) == 1) {
-			folio_unlock(folio);
-			if (folio_put_testzero(folio))
-				return FOLIO_RECLAIM_FREE;
-			/*
-			 * rare race with speculative reference.
-			 * the speculative reference will free
-			 * this folio shortly, so we may
-			 * increment nr_reclaimed here (and
-			 * leave it off the LRU).
-			 */
-			return FOLIO_RECLAIM_FREED;
-		}
-	}
-
-	if (folio_test_lazyfree(folio)) {
-		/* follow __remove_mapping for reference */
-		if (!folio_ref_freeze(folio, 1))
-			return FOLIO_RECLAIM_KEEP_LOCKED;
-		/*
-		 * The folio has only one reference left, which is
-		 * from the isolation. After the caller puts the
-		 * folio back on the lru and drops the reference, the
-		 * folio will be freed anyway. It doesn't matter
-		 * which lru it goes on. So we don't bother checking
-		 * the dirty flag here.
-		 */
-		count_vm_events(PGLAZYFREED, w->nr_pages);
-		count_memcg_folio_events(folio, PGLAZYFREED, w->nr_pages);
-	} else if (!mapping || !__remove_mapping(mapping, folio, true,
-						 sc->target_mem_cgroup))
-		return FOLIO_RECLAIM_KEEP_LOCKED;
-
-	folio_unlock(folio);
-	return FOLIO_RECLAIM_FREE;
+	return folio_reclaim_release(folio, mapping, w);
 }
 
 /*
