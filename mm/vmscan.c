@@ -1211,6 +1211,99 @@ static void folio_reclaim_activate(struct folio *folio,
 	}
 }
 
+/*
+ * If a folio at the tail of the LRU is under writeback, there
+ * are three cases to consider.
+ *
+ * 1) If reclaim is encountering an excessive number
+ *    of folios under writeback and this folio has both
+ *    the writeback and reclaim flags set, then it
+ *    indicates that folios are being queued for I/O but
+ *    are being recycled through the LRU before the I/O
+ *    can complete. Waiting on the folio itself risks an
+ *    indefinite stall if it is impossible to writeback
+ *    the folio due to I/O error or disconnected storage
+ *    so instead note that the LRU is being scanned too
+ *    quickly and the caller can stall after the folio
+ *    list has been processed.
+ *
+ * 2) Global or new memcg reclaim encounters a folio that is
+ *    not marked for immediate reclaim, or the caller does not
+ *    have __GFP_FS (or __GFP_IO if it's simply going to swap,
+ *    not to fs), or the folio belongs to a mapping where
+ *    waiting on writeback during reclaim may lead to a deadlock.
+ *    In this case mark the folio for immediate reclaim and
+ *    continue scanning.
+ *
+ *    Require may_enter_fs() because we would wait on fs, which
+ *    may not have submitted I/O yet. And the loop driver might
+ *    enter reclaim, and deadlock if it waits on a folio for
+ *    which it is needed to do the write (loop masks off
+ *    __GFP_IO|__GFP_FS for this reason); but more thought
+ *    would probably show more reasons.
+ *
+ * 3) Legacy memcg encounters a folio that already has the
+ *    reclaim flag set. memcg does not have any dirty folio
+ *    throttling so we could easily OOM just because too many
+ *    folios are in writeback and there is nothing else to
+ *    reclaim. Wait for the writeback to complete.
+ *
+ * In cases 1) and 2) we activate the folios to get them out of
+ * the way while we continue scanning for clean folios on the
+ * inactive list and refilling from the active list. The
+ * observation here is that waiting for disk writes is more
+ * expensive than potentially causing reloads down the line.
+ * Since they're marked for immediate reclaim, they won't put
+ * memory pressure on the cache working set any longer than it
+ * takes to write them to disk.
+ */
+static enum folio_reclaim_action
+folio_reclaim_writeback(struct folio *folio, struct shrink_folio_walk *w)
+{
+	struct scan_control *sc = w->sc;
+	struct address_space *mapping = folio_mapping(folio);
+
+	/* Case 1 above */
+	if (current_is_kswapd() &&
+	    folio_test_reclaim(folio) &&
+	    test_bit(PGDAT_WRITEBACK, &w->pgdat->flags)) {
+		w->stat->nr_immediate += w->nr_pages;
+		return FOLIO_RECLAIM_ACTIVATE;
+
+	/* Case 2 above */
+	} else if (writeback_throttling_sane(sc) ||
+	    !folio_test_reclaim(folio) ||
+	    !may_enter_fs(folio, sc->gfp_mask) ||
+	    (mapping &&
+	     mapping_writeback_may_deadlock_on_reclaim(mapping))) {
+		/*
+		 * This is slightly racy -
+		 * folio_end_writeback() might have
+		 * just cleared the reclaim flag, then
+		 * setting the reclaim flag here ends up
+		 * interpreted as the readahead flag - but
+		 * that does not matter enough to care.
+		 * What we do want is for this folio to
+		 * have the reclaim flag set next time
+		 * memcg reclaim reaches the tests above,
+		 * so it will then wait for writeback to
+		 * avoid OOM; and it's also appropriate
+		 * in global reclaim.
+		 */
+		folio_set_reclaim(folio);
+		w->stat->nr_writeback += w->nr_pages;
+		return FOLIO_RECLAIM_ACTIVATE;
+
+	/* Case 3 above */
+	} else {
+		folio_unlock(folio);
+		folio_wait_writeback(folio);
+		/* then go back and try same folio again */
+		list_add_tail(&folio->lru, w->folio_list);
+		return FOLIO_RECLAIM_DONE;
+	}
+}
+
 static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 						  struct shrink_folio_walk *w)
 {
@@ -1272,95 +1365,8 @@ static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 	if (writeback && folio_test_reclaim(folio))
 		stat->nr_congested += w->nr_pages;
 
-	/*
-	 * If a folio at the tail of the LRU is under writeback, there
-	 * are three cases to consider.
-	 *
-	 * 1) If reclaim is encountering an excessive number
-	 *    of folios under writeback and this folio has both
-	 *    the writeback and reclaim flags set, then it
-	 *    indicates that folios are being queued for I/O but
-	 *    are being recycled through the LRU before the I/O
-	 *    can complete. Waiting on the folio itself risks an
-	 *    indefinite stall if it is impossible to writeback
-	 *    the folio due to I/O error or disconnected storage
-	 *    so instead note that the LRU is being scanned too
-	 *    quickly and the caller can stall after the folio
-	 *    list has been processed.
-	 *
-	 * 2) Global or new memcg reclaim encounters a folio that is
-	 *    not marked for immediate reclaim, or the caller does not
-	 *    have __GFP_FS (or __GFP_IO if it's simply going to swap,
-	 *    not to fs), or the folio belongs to a mapping where
-	 *    waiting on writeback during reclaim may lead to a deadlock.
-	 *    In this case mark the folio for immediate reclaim and
-	 *    continue scanning.
-	 *
-	 *    Require may_enter_fs() because we would wait on fs, which
-	 *    may not have submitted I/O yet. And the loop driver might
-	 *    enter reclaim, and deadlock if it waits on a folio for
-	 *    which it is needed to do the write (loop masks off
-	 *    __GFP_IO|__GFP_FS for this reason); but more thought
-	 *    would probably show more reasons.
-	 *
-	 * 3) Legacy memcg encounters a folio that already has the
-	 *    reclaim flag set. memcg does not have any dirty folio
-	 *    throttling so we could easily OOM just because too many
-	 *    folios are in writeback and there is nothing else to
-	 *    reclaim. Wait for the writeback to complete.
-	 *
-	 * In cases 1) and 2) we activate the folios to get them out of
-	 * the way while we continue scanning for clean folios on the
-	 * inactive list and refilling from the active list. The
-	 * observation here is that waiting for disk writes is more
-	 * expensive than potentially causing reloads down the line.
-	 * Since they're marked for immediate reclaim, they won't put
-	 * memory pressure on the cache working set any longer than it
-	 * takes to write them to disk.
-	 */
-	if (folio_test_writeback(folio)) {
-		mapping = folio_mapping(folio);
-
-		/* Case 1 above */
-		if (current_is_kswapd() &&
-		    folio_test_reclaim(folio) &&
-		    test_bit(PGDAT_WRITEBACK, &w->pgdat->flags)) {
-			stat->nr_immediate += w->nr_pages;
-			return FOLIO_RECLAIM_ACTIVATE;
-
-		/* Case 2 above */
-		} else if (writeback_throttling_sane(sc) ||
-		    !folio_test_reclaim(folio) ||
-		    !may_enter_fs(folio, sc->gfp_mask) ||
-		    (mapping &&
-		     mapping_writeback_may_deadlock_on_reclaim(mapping))) {
-			/*
-			 * This is slightly racy -
-			 * folio_end_writeback() might have
-			 * just cleared the reclaim flag, then
-			 * setting the reclaim flag here ends up
-			 * interpreted as the readahead flag - but
-			 * that does not matter enough to care.
-			 * What we do want is for this folio to
-			 * have the reclaim flag set next time
-			 * memcg reclaim reaches the tests above,
-			 * so it will then wait for writeback to
-			 * avoid OOM; and it's also appropriate
-			 * in global reclaim.
-			 */
-			folio_set_reclaim(folio);
-			stat->nr_writeback += w->nr_pages;
-			return FOLIO_RECLAIM_ACTIVATE;
-
-		/* Case 3 above */
-		} else {
-			folio_unlock(folio);
-			folio_wait_writeback(folio);
-			/* then go back and try same folio again */
-			list_add_tail(&folio->lru, w->folio_list);
-			return FOLIO_RECLAIM_DONE;
-		}
-	}
+	if (folio_test_writeback(folio))
+		return folio_reclaim_writeback(folio, w);
 
 	if (!w->ignore_references)
 		references = folio_check_references(folio, sc);
