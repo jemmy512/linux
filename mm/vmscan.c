@@ -1376,6 +1376,44 @@ folio_reclaim_prepare_swap(struct folio *folio, struct shrink_folio_walk *w)
 	return FOLIO_RECLAIM_NEXT;
 }
 
+/*
+ * The folio is mapped into the page tables of one or more
+ * processes. Try to unmap it here. Returns true on success.
+ */
+static bool folio_reclaim_try_unmap(struct folio *folio,
+				    struct shrink_folio_walk *w)
+{
+	enum ttu_flags flags = TTU_BATCH_FLUSH;
+	bool was_swapbacked = folio_test_swapbacked(folio);
+
+	if (folio_test_pmd_mappable(folio))
+		flags |= TTU_SPLIT_HUGE_PMD;
+	/*
+	 * Without TTU_SYNC, try_to_unmap will only begin to
+	 * hold PTL from the first present PTE within a large
+	 * folio. Some initial PTEs might be skipped due to
+	 * races with parallel PTE writes in which PTEs can be
+	 * cleared temporarily before being written new present
+	 * values. This will lead to a large folio is still
+	 * mapped while some subpages have been partially
+	 * unmapped after try_to_unmap; TTU_SYNC helps
+	 * try_to_unmap acquire PTL from the first PTE,
+	 * eliminating the influence of temporary PTE values.
+	 */
+	if (folio_test_large(folio))
+		flags |= TTU_SYNC;
+
+	try_to_unmap(folio, flags);
+	if (folio_mapped(folio)) {
+		w->stat->nr_unmap_fail += w->nr_pages;
+		if (!was_swapbacked &&
+		    folio_test_swapbacked(folio))
+			w->stat->nr_lazyfree_fail += w->nr_pages;
+		return false;
+	}
+	return true;
+}
+
 static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 						  struct shrink_folio_walk *w)
 {
@@ -1479,40 +1517,8 @@ static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 
 	folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
 
-	/*
-	 * The folio is mapped into the page tables of one or more
-	 * processes. Try to unmap it here.
-	 */
-	if (folio_mapped(folio)) {
-		enum ttu_flags flags = TTU_BATCH_FLUSH;
-		bool was_swapbacked = folio_test_swapbacked(folio);
-
-		if (folio_test_pmd_mappable(folio))
-			flags |= TTU_SPLIT_HUGE_PMD;
-		/*
-		 * Without TTU_SYNC, try_to_unmap will only begin to
-		 * hold PTL from the first present PTE within a large
-		 * folio. Some initial PTEs might be skipped due to
-		 * races with parallel PTE writes in which PTEs can be
-		 * cleared temporarily before being written new present
-		 * values. This will lead to a large folio is still
-		 * mapped while some subpages have been partially
-		 * unmapped after try_to_unmap; TTU_SYNC helps
-		 * try_to_unmap acquire PTL from the first PTE,
-		 * eliminating the influence of temporary PTE values.
-		 */
-		if (folio_test_large(folio))
-			flags |= TTU_SYNC;
-
-		try_to_unmap(folio, flags);
-		if (folio_mapped(folio)) {
-			stat->nr_unmap_fail += w->nr_pages;
-			if (!was_swapbacked &&
-			    folio_test_swapbacked(folio))
-				stat->nr_lazyfree_fail += w->nr_pages;
-			return FOLIO_RECLAIM_ACTIVATE;
-		}
-	}
+	if (folio_mapped(folio) && !folio_reclaim_try_unmap(folio, w))
+		return FOLIO_RECLAIM_ACTIVATE;
 
 	/*
 	 * Folio is unmapped now so it cannot be newly pinned anymore.
