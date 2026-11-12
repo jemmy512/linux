@@ -1414,6 +1414,75 @@ static bool folio_reclaim_try_unmap(struct folio *folio,
 	return true;
 }
 
+/*
+ * Write out a dirty folio. Returns FOLIO_RECLAIM_NEXT, with the folio
+ * locked, if reclaim can go on to free it, and updates @mapping if the
+ * folio was written synchronously and relocked.
+ */
+static enum folio_reclaim_action
+folio_reclaim_writeout(struct folio *folio, struct address_space **mapping,
+		       struct shrink_folio_walk *w)
+{
+	struct scan_control *sc = w->sc;
+
+	if (folio_is_file_lru(folio)) {
+		/*
+		 * Immediately reclaim when written back.
+		 * Similar in principle to folio_deactivate()
+		 * except we already have the folio isolated
+		 * and know it's dirty
+		 */
+		node_stat_mod_folio(folio, NR_VMSCAN_IMMEDIATE,
+				w->nr_pages);
+		if (!folio_test_reclaim(folio))
+			folio_set_reclaim(folio);
+
+		return FOLIO_RECLAIM_ACTIVATE;
+	}
+
+	if (!may_enter_fs(folio, sc->gfp_mask))
+		return FOLIO_RECLAIM_KEEP_LOCKED;
+	if (!sc->may_writepage)
+		return FOLIO_RECLAIM_KEEP_LOCKED;
+
+	/*
+	 * Folio is dirty. Flush the TLB if a writable entry
+	 * potentially exists to avoid CPU writes after I/O
+	 * starts and then write it out here.
+	 */
+	try_to_unmap_flush_dirty();
+	switch (pageout(w->ctx, *mapping, folio, w->folio_list)) {
+	case PAGE_KEEP:
+		return FOLIO_RECLAIM_KEEP_LOCKED;
+	case PAGE_ACTIVATE:
+		/* shmem folios may be split by writeout */
+		folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
+		return FOLIO_RECLAIM_ACTIVATE;
+	case PAGE_SUCCESS:
+		folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
+		if (folio_test_writeback(folio))
+			return FOLIO_RECLAIM_KEEP;
+		if (folio_test_dirty(folio))
+			return FOLIO_RECLAIM_KEEP;
+
+		/*
+		 * A synchronous write - probably a ramdisk.  Go
+		 * ahead and try to reclaim the folio.
+		 */
+		if (!folio_trylock(folio))
+			return FOLIO_RECLAIM_KEEP;
+		if (folio_test_dirty(folio) ||
+		    folio_test_writeback(folio))
+			return FOLIO_RECLAIM_KEEP_LOCKED;
+		*mapping = folio_mapping(folio);
+		fallthrough;
+	case PAGE_CLEAN:
+		; /* try to free the folio */
+	}
+
+	return FOLIO_RECLAIM_NEXT;
+}
+
 static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 						  struct shrink_folio_walk *w)
 {
@@ -1532,60 +1601,9 @@ static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
 
 	mapping = folio_mapping(folio);
 	if (folio_test_dirty(folio)) {
-		if (folio_is_file_lru(folio)) {
-			/*
-			 * Immediately reclaim when written back.
-			 * Similar in principle to folio_deactivate()
-			 * except we already have the folio isolated
-			 * and know it's dirty
-			 */
-			node_stat_mod_folio(folio, NR_VMSCAN_IMMEDIATE,
-					w->nr_pages);
-			if (!folio_test_reclaim(folio))
-				folio_set_reclaim(folio);
-
-			return FOLIO_RECLAIM_ACTIVATE;
-		}
-
-		if (!may_enter_fs(folio, sc->gfp_mask))
-			return FOLIO_RECLAIM_KEEP_LOCKED;
-		if (!sc->may_writepage)
-			return FOLIO_RECLAIM_KEEP_LOCKED;
-
-		/*
-		 * Folio is dirty. Flush the TLB if a writable entry
-		 * potentially exists to avoid CPU writes after I/O
-		 * starts and then write it out here.
-		 */
-		try_to_unmap_flush_dirty();
-		switch (pageout(w->ctx, mapping, folio, w->folio_list)) {
-		case PAGE_KEEP:
-			return FOLIO_RECLAIM_KEEP_LOCKED;
-		case PAGE_ACTIVATE:
-			/* shmem folios may be split by writeout */
-			folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
-			return FOLIO_RECLAIM_ACTIVATE;
-		case PAGE_SUCCESS:
-			folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
-			if (folio_test_writeback(folio))
-				return FOLIO_RECLAIM_KEEP;
-			if (folio_test_dirty(folio))
-				return FOLIO_RECLAIM_KEEP;
-
-			/*
-			 * A synchronous write - probably a ramdisk.  Go
-			 * ahead and try to reclaim the folio.
-			 */
-			if (!folio_trylock(folio))
-				return FOLIO_RECLAIM_KEEP;
-			if (folio_test_dirty(folio) ||
-			    folio_test_writeback(folio))
-				return FOLIO_RECLAIM_KEEP_LOCKED;
-			mapping = folio_mapping(folio);
-			fallthrough;
-		case PAGE_CLEAN:
-			; /* try to free the folio below */
-		}
+		act = folio_reclaim_writeout(folio, &mapping, w);
+		if (act != FOLIO_RECLAIM_NEXT)
+			return act;
 	}
 
 	/*
