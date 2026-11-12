@@ -1170,6 +1170,459 @@ static void folio_reclaim_fixup_split(struct folio *folio,
 }
 
 /*
+ * What shrink_one_folio() decided to do with a folio, and whether the
+ * folio is still locked.
+ */
+enum folio_reclaim_action {
+	FOLIO_RECLAIM_FREE,		/* unlocked, refcount dropped to zero */
+	FOLIO_RECLAIM_FREED,		/* unlocked, freed by a racing reference */
+	FOLIO_RECLAIM_ACTIVATE,		/* locked */
+	FOLIO_RECLAIM_KEEP_LOCKED,	/* locked */
+	FOLIO_RECLAIM_KEEP,		/* unlocked */
+	FOLIO_RECLAIM_DONE,		/* handed off, nothing left to do */
+};
+
+struct shrink_folio_walk {
+	struct pglist_data *pgdat;
+	struct scan_control *sc;
+	struct reclaim_stat *stat;
+	struct list_head *folio_list;
+	struct list_head *demote_folios;
+	struct swap_io_ctx *ctx;
+	bool do_demote_pass;
+	bool ignore_references;
+	unsigned int nr_pages;		/* base pages in the current folio */
+};
+
+static void folio_reclaim_activate(struct folio *folio,
+				   struct shrink_folio_walk *w)
+{
+	/* Not a candidate for swapping, so reclaim swap space. */
+	if (folio_test_swapcache(folio) &&
+	    (mem_cgroup_swap_full(folio) || folio_test_mlocked(folio)))
+		folio_free_swap(folio);
+	VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
+	if (!folio_test_mlocked(folio)) {
+		int type = folio_is_file_lru(folio);
+
+		folio_set_active(folio);
+		w->stat->nr_activate[type] += w->nr_pages;
+		count_memcg_folio_events(folio, PGACTIVATE, w->nr_pages);
+	}
+}
+
+static enum folio_reclaim_action shrink_one_folio(struct folio *folio,
+						  struct shrink_folio_walk *w)
+{
+	struct scan_control *sc = w->sc;
+	struct reclaim_stat *stat = w->stat;
+	struct address_space *mapping;
+	enum folio_references references = FOLIOREF_RECLAIM;
+	bool dirty, writeback;
+
+	if (!folio_trylock(folio))
+		return FOLIO_RECLAIM_KEEP;
+
+	if (folio_contain_hwpoisoned_page(folio)) {
+		/*
+		 * unmap_poisoned_folio() can't handle large
+		 * folio, just skip it. memory_failure() will
+		 * handle it if the UCE is triggered again.
+		 */
+		if (folio_test_large(folio))
+			return FOLIO_RECLAIM_KEEP_LOCKED;
+
+		unmap_poisoned_folio(folio, folio_pfn(folio), false);
+		folio_unlock(folio);
+		folio_put(folio);
+		return FOLIO_RECLAIM_DONE;
+	}
+
+	VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
+
+	w->nr_pages = folio_nr_pages(folio);
+
+	/* Account the number of base pages */
+	sc->nr_scanned += w->nr_pages;
+
+	if (unlikely(!folio_evictable(folio)))
+		return FOLIO_RECLAIM_ACTIVATE;
+
+	if (!sc->may_unmap && folio_mapped(folio))
+		return FOLIO_RECLAIM_KEEP_LOCKED;
+
+	/*
+	 * The number of dirty pages determines if a node is marked
+	 * reclaim_congested. kswapd will stall and start writing
+	 * folios if the tail of the LRU is all dirty unqueued folios.
+	 */
+	folio_check_dirty_writeback(folio, &dirty, &writeback);
+	if (dirty || writeback)
+		stat->nr_dirty += w->nr_pages;
+
+	if (dirty && !writeback)
+		stat->nr_unqueued_dirty += w->nr_pages;
+
+	/*
+	 * Treat this folio as congested if folios are cycling
+	 * through the LRU so quickly that the folios marked
+	 * for immediate reclaim are making it to the end of
+	 * the LRU a second time.
+	 */
+	if (writeback && folio_test_reclaim(folio))
+		stat->nr_congested += w->nr_pages;
+
+	/*
+	 * If a folio at the tail of the LRU is under writeback, there
+	 * are three cases to consider.
+	 *
+	 * 1) If reclaim is encountering an excessive number
+	 *    of folios under writeback and this folio has both
+	 *    the writeback and reclaim flags set, then it
+	 *    indicates that folios are being queued for I/O but
+	 *    are being recycled through the LRU before the I/O
+	 *    can complete. Waiting on the folio itself risks an
+	 *    indefinite stall if it is impossible to writeback
+	 *    the folio due to I/O error or disconnected storage
+	 *    so instead note that the LRU is being scanned too
+	 *    quickly and the caller can stall after the folio
+	 *    list has been processed.
+	 *
+	 * 2) Global or new memcg reclaim encounters a folio that is
+	 *    not marked for immediate reclaim, or the caller does not
+	 *    have __GFP_FS (or __GFP_IO if it's simply going to swap,
+	 *    not to fs), or the folio belongs to a mapping where
+	 *    waiting on writeback during reclaim may lead to a deadlock.
+	 *    In this case mark the folio for immediate reclaim and
+	 *    continue scanning.
+	 *
+	 *    Require may_enter_fs() because we would wait on fs, which
+	 *    may not have submitted I/O yet. And the loop driver might
+	 *    enter reclaim, and deadlock if it waits on a folio for
+	 *    which it is needed to do the write (loop masks off
+	 *    __GFP_IO|__GFP_FS for this reason); but more thought
+	 *    would probably show more reasons.
+	 *
+	 * 3) Legacy memcg encounters a folio that already has the
+	 *    reclaim flag set. memcg does not have any dirty folio
+	 *    throttling so we could easily OOM just because too many
+	 *    folios are in writeback and there is nothing else to
+	 *    reclaim. Wait for the writeback to complete.
+	 *
+	 * In cases 1) and 2) we activate the folios to get them out of
+	 * the way while we continue scanning for clean folios on the
+	 * inactive list and refilling from the active list. The
+	 * observation here is that waiting for disk writes is more
+	 * expensive than potentially causing reloads down the line.
+	 * Since they're marked for immediate reclaim, they won't put
+	 * memory pressure on the cache working set any longer than it
+	 * takes to write them to disk.
+	 */
+	if (folio_test_writeback(folio)) {
+		mapping = folio_mapping(folio);
+
+		/* Case 1 above */
+		if (current_is_kswapd() &&
+		    folio_test_reclaim(folio) &&
+		    test_bit(PGDAT_WRITEBACK, &w->pgdat->flags)) {
+			stat->nr_immediate += w->nr_pages;
+			return FOLIO_RECLAIM_ACTIVATE;
+
+		/* Case 2 above */
+		} else if (writeback_throttling_sane(sc) ||
+		    !folio_test_reclaim(folio) ||
+		    !may_enter_fs(folio, sc->gfp_mask) ||
+		    (mapping &&
+		     mapping_writeback_may_deadlock_on_reclaim(mapping))) {
+			/*
+			 * This is slightly racy -
+			 * folio_end_writeback() might have
+			 * just cleared the reclaim flag, then
+			 * setting the reclaim flag here ends up
+			 * interpreted as the readahead flag - but
+			 * that does not matter enough to care.
+			 * What we do want is for this folio to
+			 * have the reclaim flag set next time
+			 * memcg reclaim reaches the tests above,
+			 * so it will then wait for writeback to
+			 * avoid OOM; and it's also appropriate
+			 * in global reclaim.
+			 */
+			folio_set_reclaim(folio);
+			stat->nr_writeback += w->nr_pages;
+			return FOLIO_RECLAIM_ACTIVATE;
+
+		/* Case 3 above */
+		} else {
+			folio_unlock(folio);
+			folio_wait_writeback(folio);
+			/* then go back and try same folio again */
+			list_add_tail(&folio->lru, w->folio_list);
+			return FOLIO_RECLAIM_DONE;
+		}
+	}
+
+	if (!w->ignore_references)
+		references = folio_check_references(folio, sc);
+
+	switch (references) {
+	case FOLIOREF_ACTIVATE:
+		return FOLIO_RECLAIM_ACTIVATE;
+	case FOLIOREF_KEEP:
+		stat->nr_ref_keep += w->nr_pages;
+		return FOLIO_RECLAIM_KEEP_LOCKED;
+	case FOLIOREF_RECLAIM:
+		; /* try to reclaim the folio below */
+	}
+
+	/*
+	 * Before reclaiming the folio, try to relocate
+	 * its contents to another node.
+	 */
+	if (w->do_demote_pass &&
+	    (thp_migration_supported() || !folio_test_large(folio))) {
+		list_add(&folio->lru, w->demote_folios);
+		folio_unlock(folio);
+		return FOLIO_RECLAIM_DONE;
+	}
+
+	/*
+	 * Anonymous process memory has backing store?
+	 * Try to allocate it some swap space here.
+	 * Lazyfree folio could be freed directly
+	 */
+	if (folio_test_anon(folio) && folio_test_swapbacked(folio) &&
+			!folio_test_swapcache(folio)) {
+		int ret;
+
+		if (!(sc->gfp_mask & __GFP_IO))
+			return FOLIO_RECLAIM_KEEP_LOCKED;
+		if (folio_maybe_dma_pinned(folio))
+			return FOLIO_RECLAIM_KEEP_LOCKED;
+		if (folio_test_large(folio)) {
+			/* cannot split folio, skip it */
+			if (folio_expected_ref_count(folio) !=
+			    folio_ref_count(folio) - 1)
+				return FOLIO_RECLAIM_ACTIVATE;
+			/*
+			 * Split partially mapped folios right away.
+			 * We can free the unmapped pages without IO.
+			 */
+			if (data_race(!list_empty(&folio->_deferred_list) &&
+			    folio_test_partially_mapped(folio)) &&
+			    split_folio_to_list(folio, w->folio_list))
+				return FOLIO_RECLAIM_ACTIVATE;
+		}
+		ret = folio_alloc_swap(folio);
+		if (ret) {
+			int __maybe_unused order = folio_order(folio);
+
+			if (!folio_test_large(folio)) {
+				folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
+				return FOLIO_RECLAIM_ACTIVATE;
+			}
+			if (ret != -E2BIG)
+				return FOLIO_RECLAIM_ACTIVATE;
+			/* Fallback to swap normal pages */
+			if (split_folio_to_list(folio, w->folio_list))
+				return FOLIO_RECLAIM_ACTIVATE;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+			if (w->nr_pages >= HPAGE_PMD_NR) {
+				count_memcg_folio_events(folio,
+					THP_SWPOUT_FALLBACK, 1);
+				count_vm_event(THP_SWPOUT_FALLBACK);
+			}
+#endif
+			count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
+			if (folio_alloc_swap(folio)) {
+				folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
+				return FOLIO_RECLAIM_ACTIVATE;
+			}
+		}
+		/*
+		 * Normally the folio will be dirtied in unmap because
+		 * its pte should be dirty. A special case is MADV_FREE
+		 * page. The page's pte could have dirty bit cleared but
+		 * the folio's SwapBacked flag is still set because
+		 * clearing the dirty bit and SwapBacked flag has no
+		 * lock protected. For such folio, unmap will not set
+		 * dirty bit for it, so folio reclaim will not write the
+		 * folio out. This can cause data corruption when the
+		 * folio is swapped in later. Always setting the dirty
+		 * flag for the folio solves the problem.
+		 */
+		folio_mark_dirty(folio);
+	}
+
+	folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
+
+	/*
+	 * The folio is mapped into the page tables of one or more
+	 * processes. Try to unmap it here.
+	 */
+	if (folio_mapped(folio)) {
+		enum ttu_flags flags = TTU_BATCH_FLUSH;
+		bool was_swapbacked = folio_test_swapbacked(folio);
+
+		if (folio_test_pmd_mappable(folio))
+			flags |= TTU_SPLIT_HUGE_PMD;
+		/*
+		 * Without TTU_SYNC, try_to_unmap will only begin to
+		 * hold PTL from the first present PTE within a large
+		 * folio. Some initial PTEs might be skipped due to
+		 * races with parallel PTE writes in which PTEs can be
+		 * cleared temporarily before being written new present
+		 * values. This will lead to a large folio is still
+		 * mapped while some subpages have been partially
+		 * unmapped after try_to_unmap; TTU_SYNC helps
+		 * try_to_unmap acquire PTL from the first PTE,
+		 * eliminating the influence of temporary PTE values.
+		 */
+		if (folio_test_large(folio))
+			flags |= TTU_SYNC;
+
+		try_to_unmap(folio, flags);
+		if (folio_mapped(folio)) {
+			stat->nr_unmap_fail += w->nr_pages;
+			if (!was_swapbacked &&
+			    folio_test_swapbacked(folio))
+				stat->nr_lazyfree_fail += w->nr_pages;
+			return FOLIO_RECLAIM_ACTIVATE;
+		}
+	}
+
+	/*
+	 * Folio is unmapped now so it cannot be newly pinned anymore.
+	 * No point in trying to reclaim folio if it is pinned.
+	 * Furthermore we don't want to reclaim underlying fs metadata
+	 * if the folio is pinned and thus potentially modified by the
+	 * pinning process as that may upset the filesystem.
+	 */
+	if (folio_maybe_dma_pinned(folio))
+		return FOLIO_RECLAIM_ACTIVATE;
+
+	mapping = folio_mapping(folio);
+	if (folio_test_dirty(folio)) {
+		if (folio_is_file_lru(folio)) {
+			/*
+			 * Immediately reclaim when written back.
+			 * Similar in principle to folio_deactivate()
+			 * except we already have the folio isolated
+			 * and know it's dirty
+			 */
+			node_stat_mod_folio(folio, NR_VMSCAN_IMMEDIATE,
+					w->nr_pages);
+			if (!folio_test_reclaim(folio))
+				folio_set_reclaim(folio);
+
+			return FOLIO_RECLAIM_ACTIVATE;
+		}
+
+		if (!may_enter_fs(folio, sc->gfp_mask))
+			return FOLIO_RECLAIM_KEEP_LOCKED;
+		if (!sc->may_writepage)
+			return FOLIO_RECLAIM_KEEP_LOCKED;
+
+		/*
+		 * Folio is dirty. Flush the TLB if a writable entry
+		 * potentially exists to avoid CPU writes after I/O
+		 * starts and then write it out here.
+		 */
+		try_to_unmap_flush_dirty();
+		switch (pageout(w->ctx, mapping, folio, w->folio_list)) {
+		case PAGE_KEEP:
+			return FOLIO_RECLAIM_KEEP_LOCKED;
+		case PAGE_ACTIVATE:
+			/* shmem folios may be split by writeout */
+			folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
+			return FOLIO_RECLAIM_ACTIVATE;
+		case PAGE_SUCCESS:
+			folio_reclaim_fixup_split(folio, sc, &w->nr_pages);
+			if (folio_test_writeback(folio))
+				return FOLIO_RECLAIM_KEEP;
+			if (folio_test_dirty(folio))
+				return FOLIO_RECLAIM_KEEP;
+
+			/*
+			 * A synchronous write - probably a ramdisk.  Go
+			 * ahead and try to reclaim the folio.
+			 */
+			if (!folio_trylock(folio))
+				return FOLIO_RECLAIM_KEEP;
+			if (folio_test_dirty(folio) ||
+			    folio_test_writeback(folio))
+				return FOLIO_RECLAIM_KEEP_LOCKED;
+			mapping = folio_mapping(folio);
+			fallthrough;
+		case PAGE_CLEAN:
+			; /* try to free the folio below */
+		}
+	}
+
+	/*
+	 * If the folio has buffers, try to free the buffer
+	 * mappings associated with this folio. If we succeed
+	 * we try to free the folio as well.
+	 *
+	 * We do this even if the folio is dirty.
+	 * filemap_release_folio() does not perform I/O, but it
+	 * is possible for a folio to have the dirty flag set,
+	 * but it is actually clean (all its buffers are clean).
+	 * This happens if the buffers were written out directly,
+	 * with bh_submit(). ext3 will do this, as well as
+	 * the blockdev mapping.  filemap_release_folio() will
+	 * discover that cleanness and will drop the buffers
+	 * and mark the folio clean - it can be freed.
+	 *
+	 * Rarely, folios can have buffers and no ->mapping.
+	 * These are the folios which were not successfully
+	 * invalidated in truncate_cleanup_folio().  We try to
+	 * drop those buffers here and if that worked, and the
+	 * folio is no longer mapped into process address space
+	 * (refcount == 1) it can be freed.  Otherwise, leave
+	 * the folio on the LRU so it is swappable.
+	 */
+	if (folio_needs_release(folio)) {
+		if (!filemap_release_folio(folio, sc->gfp_mask))
+			return FOLIO_RECLAIM_ACTIVATE;
+		if (!mapping && folio_ref_count(folio) == 1) {
+			folio_unlock(folio);
+			if (folio_put_testzero(folio))
+				return FOLIO_RECLAIM_FREE;
+			/*
+			 * rare race with speculative reference.
+			 * the speculative reference will free
+			 * this folio shortly, so we may
+			 * increment nr_reclaimed here (and
+			 * leave it off the LRU).
+			 */
+			return FOLIO_RECLAIM_FREED;
+		}
+	}
+
+	if (folio_test_lazyfree(folio)) {
+		/* follow __remove_mapping for reference */
+		if (!folio_ref_freeze(folio, 1))
+			return FOLIO_RECLAIM_KEEP_LOCKED;
+		/*
+		 * The folio has only one reference left, which is
+		 * from the isolation. After the caller puts the
+		 * folio back on the lru and drops the reference, the
+		 * folio will be freed anyway. It doesn't matter
+		 * which lru it goes on. So we don't bother checking
+		 * the dirty flag here.
+		 */
+		count_vm_events(PGLAZYFREED, w->nr_pages);
+		count_memcg_folio_events(folio, PGLAZYFREED, w->nr_pages);
+	} else if (!mapping || !__remove_mapping(mapping, folio, true,
+						 sc->target_mem_cgroup))
+		return FOLIO_RECLAIM_KEEP_LOCKED;
+
+	folio_unlock(folio);
+	return FOLIO_RECLAIM_FREE;
+}
+
+/*
  * shrink_folio_list() returns the number of reclaimed pages
  */
 static unsigned int shrink_folio_list(struct list_head *folio_list,
@@ -1182,464 +1635,63 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	LIST_HEAD(demote_folios);
 	unsigned int nr_reclaimed = 0, nr_demoted = 0;
 	unsigned int pgactivate = 0;
-	bool do_demote_pass;
 	struct swap_io_ctx ctx = {};
+	struct shrink_folio_walk w = {
+		.pgdat = pgdat,
+		.sc = sc,
+		.stat = stat,
+		.folio_list = folio_list,
+		.demote_folios = &demote_folios,
+		.ctx = &ctx,
+		.ignore_references = ignore_references,
+	};
 
 	folio_batch_init(&free_folios);
 	memset(stat, 0, sizeof(*stat));
 	cond_resched();
-	do_demote_pass = can_demote(pgdat->node_id, sc, memcg);
+	w.do_demote_pass = can_demote(pgdat->node_id, sc, memcg);
 
 retry:
 	while (!list_empty(folio_list)) {
-		struct address_space *mapping;
 		struct folio *folio;
-		enum folio_references references = FOLIOREF_RECLAIM;
-		bool dirty, writeback;
-		unsigned int nr_pages;
 
 		cond_resched();
 
 		folio = lru_to_folio(folio_list);
 		list_del(&folio->lru);
 
-		if (!folio_trylock(folio))
-			goto keep;
-
-		if (folio_contain_hwpoisoned_page(folio)) {
+		switch (shrink_one_folio(folio, &w)) {
+		case FOLIO_RECLAIM_FREE:
 			/*
-			 * unmap_poisoned_folio() can't handle large
-			 * folio, just skip it. memory_failure() will
-			 * handle it if the UCE is triggered again.
+			 * Folio may get swapped out as a whole, need to account
+			 * all pages in it.
 			 */
-			if (folio_test_large(folio))
-				goto keep_locked;
+			nr_reclaimed += w.nr_pages;
 
-			unmap_poisoned_folio(folio, folio_pfn(folio), false);
+			folio_unqueue_deferred_split(folio);
+			if (folio_batch_add(&free_folios, folio) == 0) {
+				mem_cgroup_uncharge_folios(&free_folios);
+				try_to_unmap_flush();
+				free_unref_folios(&free_folios);
+			}
+			break;
+		case FOLIO_RECLAIM_FREED:
+			nr_reclaimed += w.nr_pages;
+			break;
+		case FOLIO_RECLAIM_ACTIVATE:
+			folio_reclaim_activate(folio, &w);
+			fallthrough;
+		case FOLIO_RECLAIM_KEEP_LOCKED:
 			folio_unlock(folio);
-			folio_put(folio);
-			continue;
+			fallthrough;
+		case FOLIO_RECLAIM_KEEP:
+			list_add(&folio->lru, &ret_folios);
+			VM_BUG_ON_FOLIO(folio_test_lru(folio) ||
+					folio_test_unevictable(folio), folio);
+			break;
+		case FOLIO_RECLAIM_DONE:
+			break;
 		}
-
-		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
-
-		nr_pages = folio_nr_pages(folio);
-
-		/* Account the number of base pages */
-		sc->nr_scanned += nr_pages;
-
-		if (unlikely(!folio_evictable(folio)))
-			goto activate_locked;
-
-		if (!sc->may_unmap && folio_mapped(folio))
-			goto keep_locked;
-
-		/*
-		 * The number of dirty pages determines if a node is marked
-		 * reclaim_congested. kswapd will stall and start writing
-		 * folios if the tail of the LRU is all dirty unqueued folios.
-		 */
-		folio_check_dirty_writeback(folio, &dirty, &writeback);
-		if (dirty || writeback)
-			stat->nr_dirty += nr_pages;
-
-		if (dirty && !writeback)
-			stat->nr_unqueued_dirty += nr_pages;
-
-		/*
-		 * Treat this folio as congested if folios are cycling
-		 * through the LRU so quickly that the folios marked
-		 * for immediate reclaim are making it to the end of
-		 * the LRU a second time.
-		 */
-		if (writeback && folio_test_reclaim(folio))
-			stat->nr_congested += nr_pages;
-
-		/*
-		 * If a folio at the tail of the LRU is under writeback, there
-		 * are three cases to consider.
-		 *
-		 * 1) If reclaim is encountering an excessive number
-		 *    of folios under writeback and this folio has both
-		 *    the writeback and reclaim flags set, then it
-		 *    indicates that folios are being queued for I/O but
-		 *    are being recycled through the LRU before the I/O
-		 *    can complete. Waiting on the folio itself risks an
-		 *    indefinite stall if it is impossible to writeback
-		 *    the folio due to I/O error or disconnected storage
-		 *    so instead note that the LRU is being scanned too
-		 *    quickly and the caller can stall after the folio
-		 *    list has been processed.
-		 *
-		 * 2) Global or new memcg reclaim encounters a folio that is
-		 *    not marked for immediate reclaim, or the caller does not
-		 *    have __GFP_FS (or __GFP_IO if it's simply going to swap,
-		 *    not to fs), or the folio belongs to a mapping where
-		 *    waiting on writeback during reclaim may lead to a deadlock.
-		 *    In this case mark the folio for immediate reclaim and
-		 *    continue scanning.
-		 *
-		 *    Require may_enter_fs() because we would wait on fs, which
-		 *    may not have submitted I/O yet. And the loop driver might
-		 *    enter reclaim, and deadlock if it waits on a folio for
-		 *    which it is needed to do the write (loop masks off
-		 *    __GFP_IO|__GFP_FS for this reason); but more thought
-		 *    would probably show more reasons.
-		 *
-		 * 3) Legacy memcg encounters a folio that already has the
-		 *    reclaim flag set. memcg does not have any dirty folio
-		 *    throttling so we could easily OOM just because too many
-		 *    folios are in writeback and there is nothing else to
-		 *    reclaim. Wait for the writeback to complete.
-		 *
-		 * In cases 1) and 2) we activate the folios to get them out of
-		 * the way while we continue scanning for clean folios on the
-		 * inactive list and refilling from the active list. The
-		 * observation here is that waiting for disk writes is more
-		 * expensive than potentially causing reloads down the line.
-		 * Since they're marked for immediate reclaim, they won't put
-		 * memory pressure on the cache working set any longer than it
-		 * takes to write them to disk.
-		 */
-		if (folio_test_writeback(folio)) {
-			mapping = folio_mapping(folio);
-
-			/* Case 1 above */
-			if (current_is_kswapd() &&
-			    folio_test_reclaim(folio) &&
-			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) {
-				stat->nr_immediate += nr_pages;
-				goto activate_locked;
-
-			/* Case 2 above */
-			} else if (writeback_throttling_sane(sc) ||
-			    !folio_test_reclaim(folio) ||
-			    !may_enter_fs(folio, sc->gfp_mask) ||
-			    (mapping &&
-			     mapping_writeback_may_deadlock_on_reclaim(mapping))) {
-				/*
-				 * This is slightly racy -
-				 * folio_end_writeback() might have
-				 * just cleared the reclaim flag, then
-				 * setting the reclaim flag here ends up
-				 * interpreted as the readahead flag - but
-				 * that does not matter enough to care.
-				 * What we do want is for this folio to
-				 * have the reclaim flag set next time
-				 * memcg reclaim reaches the tests above,
-				 * so it will then wait for writeback to
-				 * avoid OOM; and it's also appropriate
-				 * in global reclaim.
-				 */
-				folio_set_reclaim(folio);
-				stat->nr_writeback += nr_pages;
-				goto activate_locked;
-
-			/* Case 3 above */
-			} else {
-				folio_unlock(folio);
-				folio_wait_writeback(folio);
-				/* then go back and try same folio again */
-				list_add_tail(&folio->lru, folio_list);
-				continue;
-			}
-		}
-
-		if (!ignore_references)
-			references = folio_check_references(folio, sc);
-
-		switch (references) {
-		case FOLIOREF_ACTIVATE:
-			goto activate_locked;
-		case FOLIOREF_KEEP:
-			stat->nr_ref_keep += nr_pages;
-			goto keep_locked;
-		case FOLIOREF_RECLAIM:
-			; /* try to reclaim the folio below */
-		}
-
-		/*
-		 * Before reclaiming the folio, try to relocate
-		 * its contents to another node.
-		 */
-		if (do_demote_pass &&
-		    (thp_migration_supported() || !folio_test_large(folio))) {
-			list_add(&folio->lru, &demote_folios);
-			folio_unlock(folio);
-			continue;
-		}
-
-		/*
-		 * Anonymous process memory has backing store?
-		 * Try to allocate it some swap space here.
-		 * Lazyfree folio could be freed directly
-		 */
-		if (folio_test_anon(folio) && folio_test_swapbacked(folio) &&
-				!folio_test_swapcache(folio)) {
-			int ret;
-
-			if (!(sc->gfp_mask & __GFP_IO))
-				goto keep_locked;
-			if (folio_maybe_dma_pinned(folio))
-				goto keep_locked;
-			if (folio_test_large(folio)) {
-				/* cannot split folio, skip it */
-				if (folio_expected_ref_count(folio) !=
-				    folio_ref_count(folio) - 1)
-					goto activate_locked;
-				/*
-				 * Split partially mapped folios right away.
-				 * We can free the unmapped pages without IO.
-				 */
-				if (data_race(!list_empty(&folio->_deferred_list) &&
-				    folio_test_partially_mapped(folio)) &&
-				    split_folio_to_list(folio, folio_list))
-					goto activate_locked;
-			}
-			ret = folio_alloc_swap(folio);
-			if (ret) {
-				int __maybe_unused order = folio_order(folio);
-
-				if (!folio_test_large(folio)) {
-					folio_reclaim_fixup_split(folio, sc,
-								  &nr_pages);
-					goto activate_locked;
-				}
-				if (ret != -E2BIG)
-					goto activate_locked;
-				/* Fallback to swap normal pages */
-				if (split_folio_to_list(folio, folio_list))
-					goto activate_locked;
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-				if (nr_pages >= HPAGE_PMD_NR) {
-					count_memcg_folio_events(folio,
-						THP_SWPOUT_FALLBACK, 1);
-					count_vm_event(THP_SWPOUT_FALLBACK);
-				}
-#endif
-				count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
-				if (folio_alloc_swap(folio)) {
-					folio_reclaim_fixup_split(folio, sc,
-								  &nr_pages);
-					goto activate_locked;
-				}
-			}
-			/*
-			 * Normally the folio will be dirtied in unmap because
-			 * its pte should be dirty. A special case is MADV_FREE
-			 * page. The page's pte could have dirty bit cleared but
-			 * the folio's SwapBacked flag is still set because
-			 * clearing the dirty bit and SwapBacked flag has no
-			 * lock protected. For such folio, unmap will not set
-			 * dirty bit for it, so folio reclaim will not write the
-			 * folio out. This can cause data corruption when the
-			 * folio is swapped in later. Always setting the dirty
-			 * flag for the folio solves the problem.
-			 */
-			folio_mark_dirty(folio);
-		}
-
-		folio_reclaim_fixup_split(folio, sc, &nr_pages);
-
-		/*
-		 * The folio is mapped into the page tables of one or more
-		 * processes. Try to unmap it here.
-		 */
-		if (folio_mapped(folio)) {
-			enum ttu_flags flags = TTU_BATCH_FLUSH;
-			bool was_swapbacked = folio_test_swapbacked(folio);
-
-			if (folio_test_pmd_mappable(folio))
-				flags |= TTU_SPLIT_HUGE_PMD;
-			/*
-			 * Without TTU_SYNC, try_to_unmap will only begin to
-			 * hold PTL from the first present PTE within a large
-			 * folio. Some initial PTEs might be skipped due to
-			 * races with parallel PTE writes in which PTEs can be
-			 * cleared temporarily before being written new present
-			 * values. This will lead to a large folio is still
-			 * mapped while some subpages have been partially
-			 * unmapped after try_to_unmap; TTU_SYNC helps
-			 * try_to_unmap acquire PTL from the first PTE,
-			 * eliminating the influence of temporary PTE values.
-			 */
-			if (folio_test_large(folio))
-				flags |= TTU_SYNC;
-
-			try_to_unmap(folio, flags);
-			if (folio_mapped(folio)) {
-				stat->nr_unmap_fail += nr_pages;
-				if (!was_swapbacked &&
-				    folio_test_swapbacked(folio))
-					stat->nr_lazyfree_fail += nr_pages;
-				goto activate_locked;
-			}
-		}
-
-		/*
-		 * Folio is unmapped now so it cannot be newly pinned anymore.
-		 * No point in trying to reclaim folio if it is pinned.
-		 * Furthermore we don't want to reclaim underlying fs metadata
-		 * if the folio is pinned and thus potentially modified by the
-		 * pinning process as that may upset the filesystem.
-		 */
-		if (folio_maybe_dma_pinned(folio))
-			goto activate_locked;
-
-		mapping = folio_mapping(folio);
-		if (folio_test_dirty(folio)) {
-			if (folio_is_file_lru(folio)) {
-				/*
-				 * Immediately reclaim when written back.
-				 * Similar in principle to folio_deactivate()
-				 * except we already have the folio isolated
-				 * and know it's dirty
-				 */
-				node_stat_mod_folio(folio, NR_VMSCAN_IMMEDIATE,
-						nr_pages);
-				if (!folio_test_reclaim(folio))
-					folio_set_reclaim(folio);
-
-				goto activate_locked;
-			}
-
-			if (!may_enter_fs(folio, sc->gfp_mask))
-				goto keep_locked;
-			if (!sc->may_writepage)
-				goto keep_locked;
-
-			/*
-			 * Folio is dirty. Flush the TLB if a writable entry
-			 * potentially exists to avoid CPU writes after I/O
-			 * starts and then write it out here.
-			 */
-			try_to_unmap_flush_dirty();
-			switch (pageout(&ctx, mapping, folio, folio_list)) {
-			case PAGE_KEEP:
-				goto keep_locked;
-			case PAGE_ACTIVATE:
-				/* shmem folios may be split by writeout */
-				folio_reclaim_fixup_split(folio, sc, &nr_pages);
-				goto activate_locked;
-			case PAGE_SUCCESS:
-				folio_reclaim_fixup_split(folio, sc, &nr_pages);
-				if (folio_test_writeback(folio))
-					goto keep;
-				if (folio_test_dirty(folio))
-					goto keep;
-
-				/*
-				 * A synchronous write - probably a ramdisk.  Go
-				 * ahead and try to reclaim the folio.
-				 */
-				if (!folio_trylock(folio))
-					goto keep;
-				if (folio_test_dirty(folio) ||
-				    folio_test_writeback(folio))
-					goto keep_locked;
-				mapping = folio_mapping(folio);
-				fallthrough;
-			case PAGE_CLEAN:
-				; /* try to free the folio below */
-			}
-		}
-
-		/*
-		 * If the folio has buffers, try to free the buffer
-		 * mappings associated with this folio. If we succeed
-		 * we try to free the folio as well.
-		 *
-		 * We do this even if the folio is dirty.
-		 * filemap_release_folio() does not perform I/O, but it
-		 * is possible for a folio to have the dirty flag set,
-		 * but it is actually clean (all its buffers are clean).
-		 * This happens if the buffers were written out directly,
-		 * with bh_submit(). ext3 will do this, as well as
-		 * the blockdev mapping.  filemap_release_folio() will
-		 * discover that cleanness and will drop the buffers
-		 * and mark the folio clean - it can be freed.
-		 *
-		 * Rarely, folios can have buffers and no ->mapping.
-		 * These are the folios which were not successfully
-		 * invalidated in truncate_cleanup_folio().  We try to
-		 * drop those buffers here and if that worked, and the
-		 * folio is no longer mapped into process address space
-		 * (refcount == 1) it can be freed.  Otherwise, leave
-		 * the folio on the LRU so it is swappable.
-		 */
-		if (folio_needs_release(folio)) {
-			if (!filemap_release_folio(folio, sc->gfp_mask))
-				goto activate_locked;
-			if (!mapping && folio_ref_count(folio) == 1) {
-				folio_unlock(folio);
-				if (folio_put_testzero(folio))
-					goto free_it;
-				else {
-					/*
-					 * rare race with speculative reference.
-					 * the speculative reference will free
-					 * this folio shortly, so we may
-					 * increment nr_reclaimed here (and
-					 * leave it off the LRU).
-					 */
-					nr_reclaimed += nr_pages;
-					continue;
-				}
-			}
-		}
-
-		if (folio_test_lazyfree(folio)) {
-			/* follow __remove_mapping for reference */
-			if (!folio_ref_freeze(folio, 1))
-				goto keep_locked;
-			/*
-			 * The folio has only one reference left, which is
-			 * from the isolation. After the caller puts the
-			 * folio back on the lru and drops the reference, the
-			 * folio will be freed anyway. It doesn't matter
-			 * which lru it goes on. So we don't bother checking
-			 * the dirty flag here.
-			 */
-			count_vm_events(PGLAZYFREED, nr_pages);
-			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
-		} else if (!mapping || !__remove_mapping(mapping, folio, true,
-							 sc->target_mem_cgroup))
-			goto keep_locked;
-
-		folio_unlock(folio);
-free_it:
-		/*
-		 * Folio may get swapped out as a whole, need to account
-		 * all pages in it.
-		 */
-		nr_reclaimed += nr_pages;
-
-		folio_unqueue_deferred_split(folio);
-		if (folio_batch_add(&free_folios, folio) == 0) {
-			mem_cgroup_uncharge_folios(&free_folios);
-			try_to_unmap_flush();
-			free_unref_folios(&free_folios);
-		}
-		continue;
-
-activate_locked:
-		/* Not a candidate for swapping, so reclaim swap space. */
-		if (folio_test_swapcache(folio) &&
-		    (mem_cgroup_swap_full(folio) || folio_test_mlocked(folio)))
-			folio_free_swap(folio);
-		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
-		if (!folio_test_mlocked(folio)) {
-			int type = folio_is_file_lru(folio);
-			folio_set_active(folio);
-			stat->nr_activate[type] += nr_pages;
-			count_memcg_folio_events(folio, PGACTIVATE, nr_pages);
-		}
-keep_locked:
-		folio_unlock(folio);
-keep:
-		list_add(&folio->lru, &ret_folios);
-		VM_BUG_ON_FOLIO(folio_test_lru(folio) ||
-				folio_test_unevictable(folio), folio);
 	}
 	/* 'folio_list' is always empty here */
 
@@ -1669,7 +1721,7 @@ keep:
 		 * not real memory pressure.
 		 */
 		if (!sc->proactive) {
-			do_demote_pass = false;
+			w.do_demote_pass = false;
 			goto retry;
 		}
 	}
