@@ -1156,6 +1156,20 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 }
 
 /*
+ * Once a large folio has been split, the tail pages make their own pass
+ * through shrink_folio_list() and are accounted then.
+ */
+static void folio_reclaim_fixup_split(struct folio *folio,
+				      struct scan_control *sc,
+				      unsigned int *nr_pages)
+{
+	if (*nr_pages > 1 && !folio_test_large(folio)) {
+		sc->nr_scanned -= *nr_pages - 1;
+		*nr_pages = 1;
+	}
+}
+
+/*
  * shrink_folio_list() returns the number of reclaimed pages
  */
 static unsigned int shrink_folio_list(struct list_head *folio_list,
@@ -1386,8 +1400,11 @@ retry:
 			if (ret) {
 				int __maybe_unused order = folio_order(folio);
 
-				if (!folio_test_large(folio))
-					goto activate_locked_split;
+				if (!folio_test_large(folio)) {
+					folio_reclaim_fixup_split(folio, sc,
+								  &nr_pages);
+					goto activate_locked;
+				}
 				if (ret != -E2BIG)
 					goto activate_locked;
 				/* Fallback to swap normal pages */
@@ -1401,8 +1418,11 @@ retry:
 				}
 #endif
 				count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
-				if (folio_alloc_swap(folio))
-					goto activate_locked_split;
+				if (folio_alloc_swap(folio)) {
+					folio_reclaim_fixup_split(folio, sc,
+								  &nr_pages);
+					goto activate_locked;
+				}
 			}
 			/*
 			 * Normally the folio will be dirtied in unmap because
@@ -1419,15 +1439,7 @@ retry:
 			folio_mark_dirty(folio);
 		}
 
-		/*
-		 * If the folio was split above, the tail pages will make
-		 * their own pass through this function and be accounted
-		 * then.
-		 */
-		if ((nr_pages > 1) && !folio_test_large(folio)) {
-			sc->nr_scanned -= (nr_pages - 1);
-			nr_pages = 1;
-		}
+		folio_reclaim_fixup_split(folio, sc, &nr_pages);
 
 		/*
 		 * The folio is mapped into the page tables of one or more
@@ -1506,21 +1518,11 @@ retry:
 			case PAGE_KEEP:
 				goto keep_locked;
 			case PAGE_ACTIVATE:
-				/*
-				 * If shmem folio is split when writeback to swap,
-				 * the tail pages will make their own pass through
-				 * this function and be accounted then.
-				 */
-				if (nr_pages > 1 && !folio_test_large(folio)) {
-					sc->nr_scanned -= (nr_pages - 1);
-					nr_pages = 1;
-				}
+				/* shmem folios may be split by writeout */
+				folio_reclaim_fixup_split(folio, sc, &nr_pages);
 				goto activate_locked;
 			case PAGE_SUCCESS:
-				if (nr_pages > 1 && !folio_test_large(folio)) {
-					sc->nr_scanned -= (nr_pages - 1);
-					nr_pages = 1;
-				}
+				folio_reclaim_fixup_split(folio, sc, &nr_pages);
 				if (folio_test_writeback(folio))
 					goto keep;
 				if (folio_test_dirty(folio))
@@ -1620,15 +1622,6 @@ free_it:
 		}
 		continue;
 
-activate_locked_split:
-		/*
-		 * The tail pages that are failed to add into swap cache
-		 * reach here.  Fixup nr_scanned and nr_pages.
-		 */
-		if (nr_pages > 1) {
-			sc->nr_scanned -= (nr_pages - 1);
-			nr_pages = 1;
-		}
 activate_locked:
 		/* Not a candidate for swapping, so reclaim swap space. */
 		if (folio_test_swapcache(folio) &&
